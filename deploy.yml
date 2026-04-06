@@ -1,0 +1,37 @@
+name: 🐷 도방육종 봇 자동배포
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'bot.py'
+      - 'weaning_vision.py'
+      - 'weaning_photo_handler.py'
+      - 'requirements.txt'
+
+jobs:
+  deploy:
+    name: PC 봇 자동 재시작
+    runs-on: self-hosted   # PC에서 실행되는 runner
+
+    steps:
+      - name: 📥 코드 가져오기
+        uses: actions/checkout@v3
+
+      - name: 📝 .env 파일 생성
+        run: |
+          echo "TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}" > .env
+          echo "NOTION_TOKEN=${{ secrets.NOTION_TOKEN }}" >> .env
+          echo "ADMIN_TELEGRAM_ID=${{ secrets.ADMIN_TELEGRAM_ID }}" >> .env
+          echo "ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}" >> .env
+
+      - name: 🛑 기존 봇 종료
+        run: |
+          taskkill /f /im py.exe 2>NUL || echo "실행중인 봇 없음"
+          timeout /t 3
+
+      - name: 🐷 봇 재시작
+        run: |
+          start /B py -3.11 bot.py > bot_log.txt 2>&1
+          echo "✅ 봇 재시작 완료"
+        shell: cmd

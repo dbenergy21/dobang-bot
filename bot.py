@@ -124,6 +124,13 @@ KW_FEED_STATUS = [
     "사료늘려", "사료 늘려", "급이", "많이먹어", "못먹어",
     "사료조절", "줄여달라", "늘려달라", "조절해",
     "사료가 많", "사료가 없", "밥그릇",
+    # 베트남어 급이현황 (외국인 직원 지원)
+    "nhiều thức ăn",    # 사료 많아요
+    "thiếu thức ăn",   # 사료 없어요
+    "cho thêm",         # 더 주세요
+    "bớt thức ăn",     # 사료 줄여요
+    "thức ăn nhiều",   # 사료 많아
+    "thức ăn ít",      # 사료 적어
 ]
 
 # 약품 키워드
@@ -3249,6 +3256,9 @@ def parse_bin_number(bin_str: str) -> tuple:
 def build_dispatch_with_medicine(orders: list, date_str: str,
                                   time_str: str = "2시차",
                                   include_medicine: bool = True) -> str:
+    # 캐시가 비어있으면 자동 재로드
+    if not _medicine_cache_loaded or not _medicine_cache:
+        load_medicine_cache()
     """
     주문 목록 → 배합지시 문자 생성
     orders: [{"빈번호": "8-1", "사료종류": "육돈", "톤수": "5톤"}, ...]
