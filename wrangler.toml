@@ -1,0 +1,6 @@
+name = "dobang-dobi-bot"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+[vars]
+BOT_NAME = "도방 도비"
