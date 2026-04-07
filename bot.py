@@ -1,5 +1,9 @@
 """
-도방육종 업무봇 v5.0 - Button_data_invalid 수정버전
+도방육종 업무봇 v6.0
+개선사항:
+- 약품 주문 전용 노션 DB 저장 + 주문 문자 DM 자동 발송
+- 사료없어요/급수 이슈 → 폐사 오인식 수정 (맥락 기반 분류)
+- 위치+두수 패턴 폐사 자동 인식 (Jay-G 스타일)
 """
 import os, logging, requests, asyncio, re, json, time
 from datetime import datetime, timedelta
@@ -16,6 +20,7 @@ NOTION_DB_SHIPOUT  = "399eb8a5-ba53-4754-85bb-63828f75f6a6"
 NOTION_DB_LOG      = "1b6d6904-aed1-46e8-b378-0de23d614e10"
 NOTION_DB_VACATION = "82299f8a-772f-4bac-b470-470c2aa1b170"
 NOTION_DB_ORDER    = "c8ce6eac-dae2-429a-aa73-e43c63fe6704"
+NOTION_DB_MEDICINE = "c8ce6eac-dae2-429a-aa73-e43c63fe6704"
 NOTION_DB_WEANING  = "877cf48e-e04f-40b9-92d3-3069ac02fa1f"
 NOTION_DB_GROUP    = "3341d244-3b59-442e-bc9e-b7f124c4f31a"
 
@@ -23,10 +28,10 @@ logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=loggin
 logger = logging.getLogger(__name__)
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup([
-    [KeyboardButton("도돼지 출하 보고"), KeyboardButton("폐사 보고")],
-    [KeyboardButton("이상 보고"),         KeyboardButton("작업 완료")],
-    [KeyboardButton("휴무 신청"),          KeyboardButton("사료 주문")],
-    [KeyboardButton("약품 주문"),          KeyboardButton("소모품 주문")],
+    [KeyboardButton("출하 보고"),  KeyboardButton("폐사 보고")],
+    [KeyboardButton("이상 보고"),  KeyboardButton("작업 완료")],
+    [KeyboardButton("휴무 신청"),  KeyboardButton("사료 주문")],
+    [KeyboardButton("약품 주문"),  KeyboardButton("소모품 주문")],
 ], resize_keyboard=True, is_persistent=True)
 
 NOTION_HEADERS = {
@@ -36,7 +41,7 @@ NOTION_HEADERS = {
 }
 
 # ============================================================
-# 핵심 수정: callback_data 저장소 (64바이트 제한 해결)
+# callback_data 저장소 (64바이트 제한 해결)
 # ============================================================
 _pending = {}
 
@@ -51,39 +56,116 @@ def make_kb(action_type, data):
         InlineKeyboardButton("반려", callback_data=f"rej_{sid}"),
     ]])
 
+def make_kb3(action_type, data):
+    sid = _short_id(action_type[0])
+    _pending[sid] = {"type": action_type, **data}
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("승인", callback_data=f"apv_{sid}"),
+        InlineKeyboardButton("수정후승인", callback_data=f"mod_{sid}"),
+        InlineKeyboardButton("반려", callback_data=f"rej_{sid}"),
+    ]])
+
 # ============================================================
-# 분류 키워드
+# 개선된 분류 엔진 v2 (맥락 기반)
 # ============================================================
-KW_DEATH    = ["폐사","죽","사망","chết","die","dead"]
-KW_SHIPOUT  = ["출하","xuất","나갔","나감","ship"]
-KW_ISSUE    = ["이상","고장","문제","누수","화재","긴급","사고","broken","alarm","경보"]
-KW_VACATION = ["휴무","휴가","쉬","nghỉ","day off"]
-KW_FEED     = ["사료","feed","급이","급여사료"]
-KW_MEDICINE = ["약품","약","백신","주사","써코","마이코","타이신"]
-KW_SUPPLY   = ["소모품","장갑","마스크","비닐","주사기","세제"]
-KW_DONE     = ["완료","끝","done","finish","마무리"]
+
+# 사료 이슈 패턴 (폐사보다 먼저 체크)
+FEED_ISSUE_KW = [
+    "사료없", "사료 없", "사료많", "사료 많", "사료부족",
+    "사료없어요", "사료많아요", "급수안", "급수 안", "급수없",
+    "물없", "물 없", "단수", "사료떨어", "빈통",
+]
+
+# 시설 이상 패턴
+FACILITY_KW = [
+    "고장", "누수", "화재", "연기", "경보", "알람", "alarm",
+    "작동안", "멈췄", "멈춤", "오작동", "파손", "파열",
+    "전기", "모터", "펌프", "보일러", "환기",
+]
+
+# 확실한 폐사 단어
+DEATH_WORDS = ["폐사", "죽었", "사망", "죽음", "절명", "chết", "die", "dead"]
+
+# 출하 키워드
+SHIPOUT_KW = ["출하", "xuất", "나갔", "나감", "ship"]
+
+# 완료 키워드
+DONE_KW = ["완료", "끝", "done", "finish", "마무리", "했습니다", "했어요"]
+
+# 휴무 키워드
+VACATION_KW = ["휴무", "휴가", "쉬겠", "쉴게", "쉬어도", "nghỉ", "day off"]
+
+# 사료 주문 키워드
+FEED_ORDER_KW = ["사료 주문", "사료주문", "사료 부탁", "사료신청"]
+
+# 약품 키워드
+MEDICINE_KW = [
+    "약품", "백신", "주사", "항생제", "소염제",
+    "써코", "마이코", "구제역", "돼지열병", "PCV",
+    "타이신", "암피실린", "린코마이신", "아목시", "엔로",
+    "진프로", "서울린코", "서울아목", "토탈멕", "골든펜다",
+    "파마신", "티아싸이클린", "인섹트밸런스",
+    "약품 주문", "백신 주문", "약 주문",
+]
+
+# 소모품 키워드
+SUPPLY_KW = [
+    "소모품", "장갑", "마스크", "비닐", "주사기", "바늘",
+    "세제", "살균제", "포대", "마대", "청소도구",
+]
 
 def classify(text):
-    t = text.lower()
-    if any(k in t for k in KW_DEATH):
+    t = text.lower().strip()
+
+    # 1순위: 사료 이슈 (폐사보다 먼저!) — "사료없어요" 오인식 방지
+    if any(k in t for k in FEED_ISSUE_KW):
+        return ("feed_issue", {})
+
+    # 2순위: 시설 이상
+    if any(k in t for k in FACILITY_KW):
+        return ("issue", {})
+
+    # 3순위: 확실한 폐사 단어
+    if any(k in t for k in DEATH_WORDS):
         nums = re.findall(r"\d+", text)
-        loc  = re.search(r"[A-Za-z가-힣]+\d+[\-\.]?\d*|돈공\d+", text)
+        loc  = re.search(r"[A-Za-z가-힣]+\d+[\-\.]?\d*|돈공\d*", text)
         return ("death", {"두수": nums[0] if nums else "미상", "위치": loc.group() if loc else ""})
-    if any(k in t for k in KW_SHIPOUT):
+
+    # 4순위: Jay-G 스타일 위치+두수 패턴 (폐사 추정)
+    # 예: "B4.7...2" "돈공...1" "인큐2.1...1"
+    location_count = re.findall(
+        r"([A-Za-z가-힣]+[\d]+[\-\.\s]+[\d]*)\s*[\.\s]+(\d+)", text)
+    if location_count and not any(k in t for k in
+            ["사료", "이상", "완료", "쉬", "주문", "출하", "휴무"]):
+        total = sum(int(c) for _, c in location_count)
+        locs  = [l.strip() for l, _ in location_count]
+        return ("death_auto", {"두수": str(total), "위치": ", ".join(locs), "원문": text})
+
+    # 5순위: 출하
+    if any(k in t for k in SHIPOUT_KW):
         nums = re.findall(r"\d+", text)
         return ("shipout", {"두수": int(nums[0]) if nums else 0})
-    if any(k in t for k in KW_ISSUE):
-        return ("issue", {})
-    if any(k in t for k in KW_FEED):
-        return ("order_feed", {})
-    if any(k in t for k in KW_MEDICINE):
+
+    # 6순위: 약품 주문
+    if any(k in t for k in MEDICINE_KW):
         return ("order_medicine", {})
-    if any(k in t for k in KW_SUPPLY):
+
+    # 7순위: 소모품
+    if any(k in t for k in SUPPLY_KW):
         return ("order_supply", {})
-    if any(k in t for k in KW_VACATION):
+
+    # 8순위: 사료 (사료 이슈가 아닌 나머지)
+    if any(k in t for k in ["사료", "feed", "급이"]):
+        return ("order_feed", {})
+
+    # 9순위: 휴무
+    if any(k in t for k in VACATION_KW):
         return ("vacation", {"날짜": parse_date(text)})
-    if any(k in t for k in KW_DONE):
+
+    # 10순위: 완료
+    if any(k in t for k in DONE_KW):
         return ("done", {})
+
     return ("general", {})
 
 def parse_date(text):
@@ -95,12 +177,12 @@ def parse_date(text):
     return None
 
 STAFF_MAP = {
-    "콰":"콰","kwa":"콰","qua":"콰",
+    "콰":"콰","kwa":"콰","qua":"콰","haukaka":"콰",
     "썬":"썬","sun":"썬","jay":"썬",
     "츠엉":"츠엉","truong":"츠엉",
     "하우":"하우","hau":"하우",
-    "박태식":"박태식","태식":"박태식",
-    "동":"동","dong":"동","ka":"동",
+    "박태식":"박태식","태식":"박태식","신기철":"박태식",
+    "동":"동","dong":"동"," ka":"동",
 }
 def get_staff(name):
     n = name.lower()
@@ -190,54 +272,101 @@ def n_vacation_update(page_id, 상태):
     except Exception as e: logger.error(f"휴무 업데이트: {e}")
 
 # ============================================================
-# 콜백 핸들러 (수정됨: short_id 방식)
+# 약품 주문 파싱 및 주문 문자 생성
+# ============================================================
+def parse_medicine_items(text):
+    items = []
+    lines = text.replace(",", "\n").replace("、", "\n").split("\n")
+    for line in lines:
+        line = line.strip()
+        if not line: continue
+        m = re.match(r"(.+?)\s+(\d+(?:\.\d+)?)\s*(kg|g|병|박스|포|개|ml|L|통)?", line)
+        if m:
+            items.append({
+                "품목": m.group(1).strip(),
+                "수량": m.group(2),
+                "단위": m.group(3) or "개"
+            })
+        else:
+            items.append({"품목": line, "수량": "1", "단위": "개"})
+    return items
+
+def format_medicine_order_sms(items, staff, today):
+    lines = [f"[약품 주문] {today} ({staff})"]
+    lines.append("-" * 25)
+    for i, item in enumerate(items, 1):
+        lines.append(f"{i}. {item['품목']} {item['수량']}{item['단위']}")
+    lines.append("-" * 25)
+    lines.append(f"총 {len(items)}품목")
+    return "\n".join(lines)
+
+# ============================================================
+# 콜백 핸들러
 # ============================================================
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-    if not (data.startswith("apv_") or data.startswith("rej_")):
-        return
-    action   = "approve" if data.startswith("apv_") else "reject"
-    sid      = data[4:]
-    payload  = _pending.pop(sid, None)
-    if not payload:
-        await query.edit_message_text("처리 기한 만료. 다시 신청해주세요.")
-        return
 
-    atype  = payload.get("type")
-    staff  = payload.get("staff", "")
-    gid    = payload.get("group_id", 0)
+    if data.startswith("apv_") or data.startswith("rej_"):
+        action = "approve" if data.startswith("apv_") else "reject"
+        sid     = data[4:]
+        payload = _pending.pop(sid, None)
+        if not payload:
+            await query.edit_message_text("처리 기한 만료. 다시 신청해주세요.")
+            return
+        atype  = payload.get("type")
+        staff  = payload.get("staff", "")
+        gid    = payload.get("group_id", 0)
 
-    if atype == "vacation":
-        날짜    = payload.get("date", "")
-        pid    = payload.get("page_id", "")
-        if action == "approve":
-            n_vacation_update(pid, "확정")
-            n_log(f"휴무 승인: {staff} {날짜}", "완료", 비고="대표님 승인")
-            await query.edit_message_text(f"휴무 승인\n직원: {staff}\n날짜: {날짜}")
-            if gid:
-                await ctx.bot.send_message(gid, f"휴무 승인\n{staff}님 {날짜} 휴무 확정")
-        else:
-            n_vacation_update(pid, "반려")
-            n_log(f"휴무 반려: {staff} {날짜}", "미수행", 비고="대표님 반려")
-            await query.edit_message_text(f"휴무 반려\n직원: {staff}\n날짜: {날짜}")
-            if gid:
-                await ctx.bot.send_message(gid, f"휴무 반려\n{staff}님 {날짜} 신청 반려")
+        if atype == "vacation":
+            날짜    = payload.get("date", "")
+            pid    = payload.get("page_id", "")
+            if action == "approve":
+                n_vacation_update(pid, "확정")
+                n_log(f"휴무 승인: {staff} {날짜}", "완료", 비고="대표님 승인")
+                await query.edit_message_text(f"휴무 승인\n직원: {staff}\n날짜: {날짜}")
+                if gid: await ctx.bot.send_message(gid, f"휴무 승인\n{staff}님 {날짜} 확정")
+            else:
+                n_vacation_update(pid, "반려")
+                await query.edit_message_text(f"휴무 반려\n직원: {staff}\n날짜: {날짜}")
+                if gid: await ctx.bot.send_message(gid, f"휴무 반려\n{staff}님 신청 반려")
 
-    elif atype == "order":
-        유형    = payload.get("order_type", "")
-        content = payload.get("content", "")
-        if action == "approve":
-            n_log(f"{유형} 주문 승인: {content}", "완료", 비고=f"대표님 승인 {staff}")
-            await query.edit_message_text(f"주문 승인\n{유형}\n{staff}: {content}")
-            if gid:
-                await ctx.bot.send_message(gid, f"{유형} 주문 승인\n{staff}님 주문 처리됩니다")
-        else:
-            n_log(f"{유형} 주문 반려: {content}", "미수행", 비고=f"대표님 반려 {staff}")
-            await query.edit_message_text(f"주문 반려\n{유형}\n{staff}: {content}")
-            if gid:
-                await ctx.bot.send_message(gid, f"{유형} 주문 반려\n{staff}님 주문 반려")
+        elif atype == "order":
+            유형    = payload.get("order_type", "")
+            content = payload.get("content", "")
+            if action == "approve":
+                n_log(f"{유형} 주문 승인: {content}", "완료", 비고=f"승인 {staff}")
+                await query.edit_message_text(f"주문 승인\n{유형}\n{staff}: {content}")
+                if gid: await ctx.bot.send_message(gid, f"{유형} 주문 승인\n{staff}님 주문 처리")
+            else:
+                await query.edit_message_text(f"주문 반려\n{유형}\n{staff}: {content}")
+                if gid: await ctx.bot.send_message(gid, f"{유형} 주문 반려")
+
+        elif atype == "medicine":
+            content = payload.get("content", "")
+            items   = payload.get("items", [])
+            if action == "approve":
+                n_log(f"약품 주문 승인: {content[:40]}", "완료", 비고=f"승인 {staff}")
+                today = datetime.now().strftime("%Y-%m-%d")
+                sms   = format_medicine_order_sms(items, staff, today)
+                await query.edit_message_text(f"약품 주문 승인\n\n{sms}")
+                if gid:
+                    await ctx.bot.send_message(gid,
+                        f"약품 주문 승인\n{staff}님 주문이 처리됩니다\n\n{sms}")
+            else:
+                await query.edit_message_text(f"약품 주문 반려\n{staff}: {content[:40]}")
+                if gid: await ctx.bot.send_message(gid, f"약품 주문 반려\n{staff}님")
+
+    elif data.startswith("mod_"):
+        sid     = data[4:]
+        payload = _pending.get(sid)
+        if not payload:
+            await query.edit_message_text("처리 기한 만료.")
+            return
+        ctx.user_data[f"modify_{sid}"] = payload
+        await query.edit_message_text(
+            f"수정 내용을 입력해주세요\n/modify_{sid} [수정내용]")
 
 # ============================================================
 # 일일 보고 07:00
@@ -254,16 +383,25 @@ async def daily_report(ctx):
         results = res.json().get("results", [])
     except: results = []
 
-    lines = [f"도비 일일 보고 ({yesterday})"]
-    total = 0
+    death_list, order_list, other_list = [], [], []
     for r in results:
         props = r.get("properties", {})
         업무  = props.get("업무내용", {}).get("rich_text", [{}])
         업무  = 업무[0].get("text", {}).get("content", "") if 업무 else ""
-        lines.append(f"  {업무[:40]}")
-        total += 1
-    lines.insert(1, f"총 {total}건")
-    if total == 0:
+        if "폐사" in 업무: death_list.append(업무[:40])
+        elif "주문" in 업무: order_list.append(업무[:40])
+        else: other_list.append(업무[:30])
+
+    lines = [f"도비 일일 보고 ({yesterday})", f"총 {len(results)}건\n"]
+    if death_list:
+        lines.append(f"폐사 {len(death_list)}건")
+        for d in death_list: lines.append(f"  {d}")
+    if order_list:
+        lines.append(f"주문 {len(order_list)}건")
+        for o in order_list: lines.append(f"  {o}")
+    if other_list:
+        lines.append(f"기타 {len(other_list)}건")
+    if not results:
         lines = [f"도비 일일 보고 ({yesterday})\n보고 없음"]
     await ctx.bot.send_message(chat_id=ADMIN_ID, text="\n".join(lines))
 
@@ -272,25 +410,56 @@ async def daily_report(ctx):
 # ============================================================
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "도방육종 업무봇\n버튼으로 보고하거나 텍스트로 입력하세요",
+        "도방육종 업무봇 v6.0\n버튼으로 보고하거나 텍스트로 입력하세요\nChao mung! Nhan nut hoac nhap van ban",
         reply_markup=MAIN_KEYBOARD)
+
+# ============================================================
+# 약품 주문 처리 함수
+# ============================================================
+async def process_medicine_order(msg, staff, name, text, group_id, ctx):
+    items = parse_medicine_items(text)
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    # 노션 저장 (항목별)
+    for item in items:
+        n_order(staff, "약품", f"{item['품목']} {item['수량']}{item['단위']}")
+
+    # 통합 로그
+    n_log(f"약품 주문: {text[:60]}", "완료", 비고=name)
+
+    # 주문 문자 형식 생성
+    sms = format_medicine_order_sms(items, staff, today)
+
+    await msg.reply_text(
+        f"약품 주문 접수 ({len(items)}품목)\n\n{sms}\n\n대표님 승인 대기중...",
+        reply_markup=MAIN_KEYBOARD)
+
+    # 대표님 DM — 승인 버튼 포함
+    if ADMIN_ID:
+        await ctx.bot.send_message(ADMIN_ID,
+            f"약품 주문 접수\n직원: {staff}\n\n{sms}",
+            reply_markup=make_kb3("medicine", {
+                "staff": staff,
+                "content": text[:60],
+                "items": items,
+                "group_id": group_id,
+            }))
 
 # ============================================================
 # 메인 메시지 핸들러
 # ============================================================
 BUTTONS = {
-    "도돼지 출하 보고":  ("shipout",        "몇 두 출하했나요?"),
-    "폐사 보고":        ("death",           "두수+위치 입력\n예) 돈공1.2 2두"),
-    "이상 보고":        ("issue",           "이상 내용 입력"),
-    "휴무 신청":        ("vacation",        "희망 날짜 입력\n예) 4/15"),
-    "사료 주문":        ("order_feed",      "품목+수량 입력"),
-    "약품 주문":        ("order_medicine",  "품목+수량 입력"),
-    "소모품 주문":      ("order_supply",    "품목+수량 입력"),
+    "출하 보고":   ("shipout",       "몇 두 출하했나요?"),
+    "폐사 보고":   ("death",         "두수+위치 입력\n예) 돈공1.2 2두"),
+    "이상 보고":   ("issue",         "이상 내용 입력"),
+    "휴무 신청":   ("vacation",      "희망 날짜 입력\n예) 4/15"),
+    "사료 주문":   ("order_feed",    "품목+수량 입력"),
+    "약품 주문":   ("order_medicine","약품명+수량 입력\n예) 써코백신 10병"),
+    "소모품 주문": ("order_supply",  "품목+수량 입력"),
 }
 ORDER_MAP = {
-    "order_feed":     "사료",
-    "order_medicine": "약품",
-    "order_supply":   "소모품",
+    "order_feed":  "사료",
+    "order_supply":"소모품",
 }
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -316,6 +485,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(prompt, reply_markup=MAIN_KEYBOARD)
         return
 
+    # 버튼 후 내용 입력
     if mode == "shipout":
         try:
             두수 = int(re.sub(r"[^0-9]", "", text) or "0")
@@ -323,8 +493,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             n_shipout(두수, name)
             n_log(f"출하 {두수}두", "완료", 비고=name)
             await msg.reply_text(f"출하 {두수}두 기록!", reply_markup=MAIN_KEYBOARD)
-            if ADMIN_ID:
-                await ctx.bot.send_message(ADMIN_ID, f"출하 보고\n{name}\n{두수}두")
+            if ADMIN_ID: await ctx.bot.send_message(ADMIN_ID, f"출하 보고\n{name}\n{두수}두")
             ctx.user_data["mode"] = None
         except:
             await msg.reply_text("숫자만 입력해주세요", reply_markup=MAIN_KEYBOARD)
@@ -333,16 +502,14 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if mode == "death":
         n_log(f"폐사: {text}", "완료", 비고=name)
         await msg.reply_text(f"폐사 기록\n{text}", reply_markup=MAIN_KEYBOARD)
-        if ADMIN_ID:
-            await ctx.bot.send_message(ADMIN_ID, f"폐사 보고\n{name}\n{text}")
+        if ADMIN_ID: await ctx.bot.send_message(ADMIN_ID, f"폐사 보고\n{name}\n{text}")
         ctx.user_data["mode"] = None
         return
 
     if mode == "issue":
         n_log(f"이상: {text}", "완료", 비고=name)
         await msg.reply_text(f"이상 기록\n{text}", reply_markup=MAIN_KEYBOARD)
-        if ADMIN_ID:
-            await ctx.bot.send_message(ADMIN_ID, f"이상 보고\n{name}\n{text}")
+        if ADMIN_ID: await ctx.bot.send_message(ADMIN_ID, f"이상 보고\n{name}\n{text}")
         ctx.user_data["mode"] = None
         return
 
@@ -357,7 +524,15 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"휴무 신청 접수\n{s} / {날짜}\n승인 대기중...", reply_markup=MAIN_KEYBOARD)
         if ADMIN_ID:
             await ctx.bot.send_message(ADMIN_ID, f"휴무 승인 요청\n{s} / {날짜}",
-                reply_markup=make_kb("vacation", {"staff": s, "date": 날짜, "page_id": pid, "group_id": gid}))
+                reply_markup=make_kb("vacation",
+                    {"staff": s, "date": 날짜, "page_id": pid, "group_id": gid}))
+        ctx.user_data["mode"] = None
+        return
+
+    if mode == "order_medicine":
+        s   = ctx.user_data.get("staff", staff)
+        gid = ctx.user_data.get("group_id", group_id)
+        await process_medicine_order(msg, s, name, text, gid, ctx)
         ctx.user_data["mode"] = None
         return
 
@@ -370,30 +545,71 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"{유형} 주문 접수\n{text}", reply_markup=MAIN_KEYBOARD)
         if ADMIN_ID:
             await ctx.bot.send_message(ADMIN_ID, f"{유형} 주문\n{s}\n{text[:60]}",
-                reply_markup=make_kb("order", {"staff": s, "content": text[:60], "order_type": 유형, "group_id": gid}))
+                reply_markup=make_kb("order",
+                    {"staff": s, "content": text[:60], "order_type": 유형, "group_id": gid}))
         ctx.user_data["mode"] = None
         return
 
     # 자동 분류
     cat, data = classify(text)
-    if cat == "death":
+    logger.info(f"자동분류: [{name}] {cat} / {text[:40]}")
+
+    if cat == "feed_issue":
+        # 사료 부족/급수 이슈 — 이상 보고로 처리
+        n_log(f"시설이슈: {text}", "완료", 비고=name)
+        await msg.reply_text(f"사료/급수 이슈 기록\n{text}", reply_markup=MAIN_KEYBOARD)
+        if ADMIN_ID:
+            await ctx.bot.send_message(ADMIN_ID, f"사료/급수 이슈\n{name}\n{text}")
+
+    elif cat == "issue":
+        n_log(f"이상: {text}", "완료", 비고=name)
+        if ADMIN_ID: await ctx.bot.send_message(ADMIN_ID, f"이상 감지\n{name}\n{text}")
+
+    elif cat == "death":
         두수 = data.get("두수", "미상")
         위치 = data.get("위치", "")
         n_log(f"폐사: {text}", "완료", 비고=name)
         await msg.reply_text(f"폐사 기록\n두수:{두수} 위치:{위치 or '미상'}", reply_markup=MAIN_KEYBOARD)
         if ADMIN_ID:
             await ctx.bot.send_message(ADMIN_ID, f"폐사 감지\n{name}\n{text}")
+
+    elif cat == "death_auto":
+        두수 = data.get("두수", "?")
+        위치 = data.get("위치", "")
+        원문 = data.get("원문", text)
+        n_log(f"폐사(자동): {원문}", "완료", 비고=name)
+        await msg.reply_text(
+            f"폐사 자동 기록\n두수: 총 {두수}두\n위치: {위치}",
+            reply_markup=MAIN_KEYBOARD)
+        if ADMIN_ID:
+            await ctx.bot.send_message(ADMIN_ID,
+                f"폐사 자동 인식\n{name}\n{원문}\n추정: {두수}두 / {위치}")
+
     elif cat == "shipout":
         두수 = data.get("두수", 0)
-        if isinstance(두수, int) and 두수 > 0:
-            n_shipout(두수, name)
+        if isinstance(두수, int) and 두수 > 0: n_shipout(두수, name)
         n_log(f"출하: {text}", "완료", 비고=name)
+        if ADMIN_ID: await ctx.bot.send_message(ADMIN_ID, f"출하 감지\n{name}\n{text}")
+
+    elif cat == "order_medicine":
+        await process_medicine_order(msg, staff, name, text, group_id, ctx)
+
+    elif cat == "order_feed":
+        n_order(staff, "사료", text)
+        n_log(f"사료 주문: {text}", "완료", 비고=name)
         if ADMIN_ID:
-            await ctx.bot.send_message(ADMIN_ID, f"출하 감지\n{name}\n{text}")
-    elif cat == "issue":
-        n_log(f"이상: {text}", "완료", 비고=name)
+            await ctx.bot.send_message(ADMIN_ID, f"사료 주문 감지\n{name}\n{text[:60]}",
+                reply_markup=make_kb("order",
+                    {"staff": staff, "content": text[:60], "order_type": "사료", "group_id": group_id}))
+
+    elif cat == "order_supply":
+        n_order(staff, "소모품", text)
+        n_log(f"소모품 주문: {text}", "완료", 비고=name)
         if ADMIN_ID:
-            await ctx.bot.send_message(ADMIN_ID, f"이상 감지\n{name}\n{text}")
+            await ctx.bot.send_message(ADMIN_ID, f"소모품 주문 감지\n{name}\n{text[:60]}",
+                reply_markup=make_kb("order",
+                    {"staff": staff, "content": text[:60], "order_type": "소모품", "group_id": group_id}))
+
     elif cat == "vacation":
         날짜 = data.get("날짜")
         if 날짜:
@@ -401,19 +617,12 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text(f"휴무 신청 접수: {날짜}", reply_markup=MAIN_KEYBOARD)
             if ADMIN_ID:
                 await ctx.bot.send_message(ADMIN_ID, f"휴무 승인 요청\n{staff} / {날짜}",
-                    reply_markup=make_kb("vacation", {"staff": staff, "date": 날짜, "page_id": pid, "group_id": group_id}))
+                    reply_markup=make_kb("vacation",
+                        {"staff": staff, "date": 날짜, "page_id": pid, "group_id": group_id}))
         else:
-            ctx.user_data["mode"] = "vacation"
-            ctx.user_data["group_id"] = group_id
-            ctx.user_data["staff"] = staff
+            ctx.user_data.update({"mode": "vacation", "group_id": group_id, "staff": staff})
             await msg.reply_text("희망 날짜를 입력해주세요\n예) 4/15", reply_markup=MAIN_KEYBOARD)
-    elif cat in ("order_feed", "order_medicine", "order_supply"):
-        유형 = {"order_feed": "사료", "order_medicine": "약품", "order_supply": "소모품"}[cat]
-        n_order(staff, 유형, text)
-        n_log(f"{유형} 주문: {text}", "완료", 비고=name)
-        if ADMIN_ID:
-            await ctx.bot.send_message(ADMIN_ID, f"{유형} 주문 감지\n{name}\n{text[:60]}",
-                reply_markup=make_kb("order", {"staff": staff, "content": text[:60], "order_type": 유형, "group_id": group_id}))
+
     elif cat == "done":
         n_log(f"완료: {text}", "완료", 비고=name)
     else:
@@ -464,7 +673,7 @@ async def run_bot():
     if not TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN 없음")
         return
-    logger.info("도방육종 봇 시작 v5.0")
+    logger.info("도방육종 봇 시작 v6.0")
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_callback))
