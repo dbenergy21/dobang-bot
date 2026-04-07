@@ -594,13 +594,76 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 # 사진 핸들러
 # ============================================================
+SHIPOUT_NOTE_PROMPT = """This image is a handwritten pig farm shipping instruction note (Samsung Notes drawing).
+Extract ALL shipout information visible.
+
+Return ONLY this JSON (no other text):
+{
+  "locations": [
+    {"barn": "barn name or code (e.g. B4, A3, donggong)", "count": number of pigs}
+  ],
+  "total": total number of pigs,
+  "time": "time if visible (e.g. 14:00)",
+  "date": "date if visible (e.g. 3/30)",
+  "notes": "any other notes",
+  "confidence": "high or low"
+}
+
+Rules:
+- Barn codes: Korean names like donggong/bicuk/jadonsа, or letters+numbers like B4, A3
+- Count numbers next to arrows or barn names
+- If unclear, use null
+- Return valid JSON only"""
+
+async def vision_read_shipout_note(image_bytes: bytes) -> dict:
+    import base64, json, re as _re
+    api_key = os.getenv("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return {"error": "ANTHROPIC_API_KEY not set"}
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": "claude-sonnet-4-6", "max_tokens": 500, "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+                    {"type": "text", "text": SHIPOUT_NOTE_PROMPT}
+                ],
+            }]},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        raw = resp.json()["content"][0]["text"].strip()
+        raw_clean = _re.sub(r"```(?:json)?|```", "", raw).strip()
+        return json.loads(raw_clean)
+    except Exception as e:
+        return {"error": str(e)[:80]}
+
+def n_shipout_note(result: dict, sender: str, date_str: str):
+    if not NOTION_TOKEN or result.get("error"): return
+    locations = result.get("locations", [])
+    total     = result.get("total", 0)
+    time_str  = result.get("time", "")
+    notes     = result.get("notes", "")
+    loc_text  = ", ".join(f"{l.get('barn','?')} {l.get('count','?')}두" for l in locations)
+    try:
+        n_shipout(total or 0, f"출하지시 사진 판독 ({sender}) {loc_text}")
+        n_log(f"출하지시 사진판독: {loc_text} 총{total}두 {time_str}", "완료", 비고=sender)
+    except Exception as e:
+        logger.error(f"출하노션오류: {e}")
+
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or msg.from_user.is_bot: return
-    name    = msg.from_user.full_name
-    caption = msg.caption or ""
-    mode    = ctx.user_data.get("mode", "")
+    name     = msg.from_user.full_name
+    caption  = msg.caption or ""
+    mode     = ctx.user_data.get("mode", "")
+    user_id  = msg.from_user.id
+    today    = datetime.now().strftime("%Y-%m-%d")
 
+    # ── 1. 이유 현황판 판독 ──
     weaning_kw = ["이유", "현황판", "farmsco", "모돈", "분만사", "산차"]
     if any(k in caption.lower() for k in weaning_kw) or mode == "weaning_photo" or "weaning_session" in ctx.user_data:
         try:
@@ -625,6 +688,57 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             logger.error(f"이유 사진: {e}")
         return
 
+    # ── 2. 대표님 출하지시 사진 판독 (삼성노트 그림) ──
+    is_admin_photo = (user_id == ADMIN_ID)
+    shipout_kw = ["출하", "ship", "이동", "돈공", "비육"]
+    is_shipout_note = (
+        is_admin_photo and (
+            not caption or
+            any(k in caption for k in shipout_kw) or
+            mode == "shipout"
+        )
+    )
+
+    if is_shipout_note:
+        await msg.reply_text("출하지시 사진 판독 중...", reply_markup=MAIN_KEYBOARD)
+        try:
+            photo = msg.photo[-1]
+            f = await ctx.bot.get_file(photo.file_id)
+            img = bytes(await f.download_as_bytearray())
+            result = await vision_read_shipout_note(img)
+
+            if result.get("error"):
+                await msg.reply_text(f"판독 실패: {result['error']}\n텍스트로 입력해주세요", reply_markup=MAIN_KEYBOARD)
+                return
+
+            locations = result.get("locations", [])
+            total     = result.get("total", 0)
+            time_str  = result.get("time", "")
+            date_str  = result.get("date", today)
+            notes     = result.get("notes", "")
+            confidence = result.get("confidence", "?")
+
+            loc_lines = "\n".join(f"  {l.get('barn','?')}: {l.get('count','?')}두" for l in locations)
+            reply = (
+                f"출하지시 판독 완료 ({confidence})\n"
+                f"{loc_lines}\n"
+                f"합계: {total}두\n"
+            )
+            if time_str: reply += f"시간: {time_str}\n"
+            if notes:    reply += f"메모: {notes}\n"
+
+            await msg.reply_text(reply, reply_markup=MAIN_KEYBOARD)
+
+            # 노션 저장
+            n_shipout_note(result, name, today)
+            await msg.reply_text("노션 출하 기록 저장 완료!", reply_markup=MAIN_KEYBOARD)
+
+        except Exception as e:
+            logger.error(f"출하지시 사진 오류: {e}")
+            await msg.reply_text(f"오류: {str(e)[:60]}", reply_markup=MAIN_KEYBOARD)
+        return
+
+    # ── 3. 일반 사진 ──
     n_log(f"사진: {caption or '캡션없음'}", "완료", 비고=name)
     if "폐사" in caption and ADMIN_ID:
         await ctx.bot.send_message(ADMIN_ID, f"폐사 사진\n{name}\n{caption}")
